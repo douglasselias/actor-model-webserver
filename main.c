@@ -37,7 +37,7 @@ u32 count_threads() {
   return sysinfo.dwNumberOfProcessors;
 }
 
-#define MAX_CLIENTS 100
+#define MAX_CLIENTS 2000
 SOCKET client_sockets[MAX_CLIENTS] = {0};
 u64 client_index = 0;
 
@@ -62,7 +62,7 @@ typedef struct {
 DWORD thread_proc(void* thread_args) {
   ThreadArgs* actor = (ThreadArgs*)thread_args;
   u64 thread_id = GetCurrentThreadId();
-  printf("Thread Started (ID: %llu)\n", thread_id);
+  printf("Thread started (ID: %llu)\n", thread_id);
 
   while(true) {
     while(actor->total_messages > 0) {
@@ -71,32 +71,31 @@ DWORD thread_proc(void* thread_args) {
         try_again:
         s32 a = 100;
         s32 result = a / message.value;
-        printf("Result: %d\n", result);
+        printf("Result: %d, for client %lld\n", result, message.client_index);
         actor->read_index = (actor->read_index + 1) % MAILBOX_CAPACITY;
         actor->total_messages--;
 
-        #define BUFFER_SIZE 1000
+        #define BUFFER_SIZE 200
         char buffer[BUFFER_SIZE] = {0};
         sprintf(buffer, "HTTP/1.0 200 OK\r\n"
         "Server: actor-webserver-c\r\n"
         "Content-type: text/html\r\n\r\n"
         "<p>%d</p>", result);
 
-        s32 send_result = send(client_sockets[message.client_index], buffer, BUFFER_SIZE, 0);
-        if(send_result == SOCKET_ERROR) {
-          printf("send failed with error: %d\n", WSAGetLastError());
-          return 1;
+        s32 send_result = send(client_sockets[message.client_index], buffer, (s32)strlen(buffer), 0);
+        if (send_result == SOCKET_ERROR) {
+          s32 error = WSAGetLastError();
+          if(error != WSAEWOULDBLOCK) {
+            printf("send failed with error: %d\n", error);
+            closesocket(client_sockets[message.client_index]);
+            return 1;
+          }
         }
+        closesocket(client_sockets[message.client_index]);
       }
       __except(EXCEPTION_EXECUTE_HANDLER) {
-        printf("Error detected on thread (ID: %llu)\n", thread_id);
-        printf("Restarting\n");
-        for(s32 i = 3; i >= 1; i--) {
-          printf("in %d...\n", i);
-          Sleep(1000);
-        }
+        printf("Error detected on thread (ID: %llu)\nRestarting\n", thread_id);
         message.value = 1;
-        system("cls");
         goto try_again;
       }
     }
@@ -129,12 +128,12 @@ s32 main() {
   bind(server_socket, address_info->ai_addr, (s32)address_info->ai_addrlen);
   freeaddrinfo(address_info);
   listen(server_socket, SOMAXCONN);
-  // set_non_blocking(server_socket);
+  set_non_blocking(server_socket);
 
   printf("Server is listening on http://localhost:%s\n", DEFAULT_PORT);
 
   /// Actors setup ///
-  s32 total_threads = count_threads();
+  s32 total_threads = count_threads() - 2;
   Thread* threads = calloc(sizeof(Thread), total_threads);
   for(s32 i = 0; i < total_threads; i++) {
     ThreadArgs* thread_args = calloc(sizeof(ThreadArgs), 1);
@@ -143,37 +142,50 @@ s32 main() {
   }
 
   while(true) {
-    client_sockets[client_index] = accept(server_socket, NULL, NULL);
-    printf("After accept\n");
-    if(client_sockets[client_index] != INVALID_SOCKET) {
-      // set_non_blocking(client_sockets[client_index]);
-      printf("Client connected, ID %lld\n", client_index);
+    if(client_index + 1 < MAX_CLIENTS) {
+      client_sockets[client_index] = accept(server_socket, NULL, NULL);
+    }
 
+    if(client_sockets[client_index] != INVALID_SOCKET) {
+      set_non_blocking(client_sockets[client_index]);
+      printf("Client connected, ID %lld\n", client_index);
+      client_index++;
+    } else {
+      s32 error = WSAGetLastError();
+      if(error != WSAEWOULDBLOCK) {
+        // printf("accept failed with error: %d\n", WSAGetLastError());
+        continue;
+      }
+    }
+
+    for(u32 i = 0; i < client_index; i++) {
       #define MESSAGE_BUFFER_SIZE 1000
       char receive_buffer[MESSAGE_BUFFER_SIZE];
-      s32 recv_result = recv(client_sockets[client_index], receive_buffer, MESSAGE_BUFFER_SIZE, 0);
+      s32 recv_result = recv(client_sockets[i], receive_buffer, MESSAGE_BUFFER_SIZE, 0);
+      if(recv_result <= 0) continue;
+      // if(recv_result < 0) continue;
+      // else if(recv_result == 0) closesocket(client_sockets[i]);
+      if (recv_result == 0) {
+        closesocket(client_sockets[i]);
+        // client_sockets[i] = INVALID_SOCKET;
+      }
       printf("Received: %c\n", receive_buffer[5]);
-
+  
       s32 thread_index_with_fewer_messages = 0;
       s64 min_messages = LLONG_MAX;
-      for(s32 i = 0; i < total_threads; i++) {
-        s64 total_messages = threads[i].thread_args->total_messages;
+      for(s32 j = 0; j < total_threads; j++) {
+        s64 total_messages = threads[j].thread_args->total_messages;
         if(total_messages < min_messages) {
-          thread_index_with_fewer_messages = i;
+          thread_index_with_fewer_messages = j;
           min_messages = total_messages;
         }
       }
-
+  
       ThreadArgs* actor = threads[thread_index_with_fewer_messages].thread_args;
       s32 value = receive_buffer[5] - 48;
-      Message message = {value, client_index};
+      Message message = {value, .client_index = i};
       send_message(actor, message, sizeof(message));
-      // if(recv_result <= 0) continue;
-
-      client_index++;
     }
-
-    // closesocket(client_sockets[client_index-1]);
   }
 
   return 0;

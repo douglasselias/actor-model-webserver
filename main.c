@@ -26,6 +26,8 @@ typedef double   f64;
 
 #pragma comment (lib, "Ws2_32.lib")
 
+#define LOGGER 0
+
 void set_non_blocking(SOCKET socket) {
   DWORD non_blocking = 1;
   ioctlsocket(socket, FIONBIO, &non_blocking);
@@ -37,9 +39,11 @@ u32 count_threads() {
   return sysinfo.dwNumberOfProcessors;
 }
 
-#define MAX_CLIENTS 2000
+#define MAX_CLIENTS 2000000
 SOCKET client_sockets[MAX_CLIENTS] = {0};
 u64 client_index = 0;
+u64 freelist_sockets[MAX_CLIENTS] = {0};
+s64 freelist_index = 0;
 
 typedef struct {
   s32 value;
@@ -62,7 +66,9 @@ typedef struct {
 DWORD thread_proc(void* thread_args) {
   ThreadArgs* actor = (ThreadArgs*)thread_args;
   u64 thread_id = GetCurrentThreadId();
+  #if LOGGER == 1
   printf("Thread started (ID: %llu)\n", thread_id);
+  #endif
 
   while(true) {
     while(actor->total_messages > 0) {
@@ -71,7 +77,9 @@ DWORD thread_proc(void* thread_args) {
         try_again:
         s32 a = 100;
         s32 result = a / message.value;
+        #if LOGGER == 1
         printf("Result: %d, for client %lld\n", result, message.client_index);
+        #endif
         actor->read_index = (actor->read_index + 1) % MAILBOX_CAPACITY;
         actor->total_messages--;
 
@@ -83,15 +91,14 @@ DWORD thread_proc(void* thread_args) {
         "<p>%d</p>", result);
 
         s32 send_result = send(client_sockets[message.client_index], buffer, (s32)strlen(buffer), 0);
-        if (send_result == SOCKET_ERROR) {
-          s32 error = WSAGetLastError();
-          if(error != WSAEWOULDBLOCK) {
-            printf("send failed with error: %d\n", error);
-            closesocket(client_sockets[message.client_index]);
-            return 1;
-          }
-        }
         closesocket(client_sockets[message.client_index]);
+        client_sockets[message.client_index] = INVALID_SOCKET;
+        if(freelist_index + 1 < MAX_CLIENTS) {
+          freelist_index++;
+          freelist_sockets[freelist_index] = message.client_index;
+        } else {
+          printf("Freelist is full!\n");
+        }
       }
       __except(EXCEPTION_EXECUTE_HANDLER) {
         printf("Error detected on thread (ID: %llu)\nRestarting\n", thread_id);
@@ -132,8 +139,12 @@ s32 main() {
 
   printf("Server is listening on http://localhost:%s\n", DEFAULT_PORT);
 
+  for(u64 i = 0; i < MAX_CLIENTS; i++) {
+    client_sockets[i] = INVALID_SOCKET;
+  }
+
   /// Actors setup ///
-  s32 total_threads = count_threads() - 2;
+  s32 total_threads = count_threads();
   Thread* threads = calloc(sizeof(Thread), total_threads);
   for(s32 i = 0; i < total_threads; i++) {
     ThreadArgs* thread_args = calloc(sizeof(ThreadArgs), 1);
@@ -142,34 +153,53 @@ s32 main() {
   }
 
   while(true) {
-    if(client_index + 1 < MAX_CLIENTS) {
-      client_sockets[client_index] = accept(server_socket, NULL, NULL);
-    }
+    SOCKET accepted_socket = accept(server_socket, NULL, NULL);
 
-    if(client_sockets[client_index] != INVALID_SOCKET) {
-      set_non_blocking(client_sockets[client_index]);
-      printf("Client connected, ID %lld\n", client_index);
-      client_index++;
+    if(accepted_socket != INVALID_SOCKET) {
+      if(client_index >= MAX_CLIENTS) {
+        u64 index = freelist_sockets[freelist_index];
+        client_sockets[index] = accepted_socket;
+        #if LOGGER == 1
+        printf("Client connected, ID %lld\n", index);
+        #endif
+        if(freelist_index - 1 >= 0) freelist_index--;
+      } else {
+        client_sockets[client_index] = accepted_socket;
+        #if LOGGER == 1
+        printf("Client connected, ID %lld\n", client_index);
+        #endif
+        client_index++;
+      }
+      set_non_blocking(accepted_socket);
     } else {
       s32 error = WSAGetLastError();
       if(error != WSAEWOULDBLOCK) {
-        // printf("accept failed with error: %d\n", WSAGetLastError());
         continue;
       }
     }
 
-    for(u32 i = 0; i < client_index; i++) {
+    for(u32 i = 0; i < MAX_CLIENTS; i++) {
+      if(client_sockets[i] == INVALID_SOCKET) continue;
+
       #define MESSAGE_BUFFER_SIZE 1000
       char receive_buffer[MESSAGE_BUFFER_SIZE];
       s32 recv_result = recv(client_sockets[i], receive_buffer, MESSAGE_BUFFER_SIZE, 0);
-      if(recv_result <= 0) continue;
-      // if(recv_result < 0) continue;
-      // else if(recv_result == 0) closesocket(client_sockets[i]);
-      if (recv_result == 0) {
+      if(recv_result < 0) continue;
+      if(recv_result == 0) {
         closesocket(client_sockets[i]);
-        // client_sockets[i] = INVALID_SOCKET;
+        client_sockets[i] = INVALID_SOCKET;
+        if(freelist_index + 1 < MAX_CLIENTS) {
+          freelist_index++;
+          freelist_sockets[freelist_index] = i;
+        } else {
+          printf("Freelist is full!\n");
+        }
+        continue;
       }
+
+      #if LOGGER == 1
       printf("Received: %c\n", receive_buffer[5]);
+      #endif
   
       s32 thread_index_with_fewer_messages = 0;
       s64 min_messages = LLONG_MAX;
